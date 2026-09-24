@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "class/net/net_device.h"
+#include "device/usbd_pvt.h"
 #include "esp32-hal-tinyusb.h"
 
 #include <esp_event.h>
@@ -61,6 +62,40 @@ SemaphoreHandle_t s_txMutex = nullptr;
 SemaphoreHandle_t s_txDone = nullptr;
 
 constexpr TickType_t kTxWaitTicks = pdMS_TO_TICKS(100);
+
+// --- Tout appel tud_network_* passe par la task usbd ------------------------
+// Le driver NCM de TinyUSB n'est pas reentrant : ses listes de NTB et son
+// endpoint de notification sont manipules par la task usbd (SET_INTERFACE,
+// fins de transfert, reset de bus). Les appeler depuis lwIP, la task RX ou
+// loop() les corrompt en course : l'hote ne recoit pas NETWORK_CONNECTION et
+// n'active jamais l'interface de donnees (lien « inactive », envois en
+// timeout), ou la boucle se fige. Meme parti que esp_tinyusb (tinyusb_net.c) :
+// usbd_defer_func() execute l'appel dans la task usbd.
+bool s_txOk = false;
+uint16_t s_txLen = 0;
+
+void txDeferred(void* arg) {
+  (void)arg;
+  s_txOk = false;
+  if (tud_network_can_xmit(s_txLen)) {
+    tud_network_xmit(s_txBuf, s_txLen);  // xmit_cb recopie de facon synchrone
+    s_txOk = true;
+  }
+  xSemaphoreGive(s_txDone);
+}
+
+void recvRenewDeferred(void* arg) {
+  (void)arg;
+  tud_network_recv_renew();
+}
+
+void linkStateDeferred(void* arg) {
+  tud_network_link_state(0, arg != nullptr);
+}
+
+void deferLinkState(bool up) {
+  usbd_defer_func(linkStateDeferred, up ? (void*)1 : nullptr, false);
+}
 
 void deriveMacs() {
   if (s_devMacStr[0]) {
@@ -126,20 +161,20 @@ esp_err_t usbnetTransmit(void* h, void* buffer, size_t len) {
   }
 
   esp_err_t result = ESP_ERR_TIMEOUT;
+  memcpy(s_txBuf, buffer, len);
+  s_txLen = (uint16_t)len;
   const TickType_t deadline = xTaskGetTickCount() + kTxWaitTicks;
   while (xTaskGetTickCount() < deadline) {
-    if (tud_network_can_xmit((uint16_t)len)) {
-      memcpy(s_txBuf, buffer, len);
-      xSemaphoreTake(s_txDone, 0);  // purge un eventuel reliquat
-      tud_network_xmit(s_txBuf, (uint16_t)len);
-      // xmit_cb peut etre synchrone ou differe selon la version de TinyUSB :
-      // on attend la recopie dans les deux cas plutot que de parier.
-      if (xSemaphoreTake(s_txDone, kTxWaitTicks) == pdTRUE) {
-        result = ESP_OK;
-      }
+    xSemaphoreTake(s_txDone, 0);  // purge un eventuel reliquat
+    usbd_defer_func(txDeferred, nullptr, false);
+    if (xSemaphoreTake(s_txDone, kTxWaitTicks) != pdTRUE) {
+      break;  // task usbd muette : on abandonne cette trame
+    }
+    if (s_txOk) {
+      result = ESP_OK;
       break;
     }
-    vTaskDelay(1);
+    vTaskDelay(1);  // NTB pleins : on laisse l'hote en vider un
   }
 
   if (result == ESP_OK) {
@@ -187,7 +222,7 @@ void rxTask(void* arg) {
         s_stats.rxFrames++;
       }
     }
-    tud_network_recv_renew();
+    usbd_defer_func(recvRenewDeferred, nullptr, false);
   }
 }
 
@@ -229,9 +264,6 @@ extern "C" bool tud_network_recv_cb(const uint8_t* src, uint16_t size) {
 
 extern "C" uint16_t tud_network_xmit_cb(uint8_t* dst, void* ref, uint16_t arg) {
   memcpy(dst, ref, arg);
-  if (s_txDone != nullptr) {
-    xSemaphoreGive(s_txDone);
-  }
   return arg;
 }
 
@@ -376,7 +408,7 @@ void UsbNetService::update() {
   const bool mounted = tud_mounted();
   if (mounted != s_linkUp) {
     s_linkUp = mounted;
-    tud_network_link_state(0, mounted);
+    deferLinkState(mounted);
 
     if (s_started && s_netif != nullptr) {
       if (mounted) {
@@ -410,7 +442,10 @@ void UsbNetService::update() {
   const uint32_t now = millis();
   if (s_linkUp && now - s_lastLinkAssert > 1000) {
     s_lastLinkAssert = now;
-    tud_network_link_state(0, true);
+    deferLinkState(true);
+    // Filet : un renew reporte peut se perdre si la file d'evenements usbd
+    // deborde, et le RX resterait fige. Un renew de trop est sans effet.
+    usbd_defer_func(recvRenewDeferred, nullptr, false);
   }
 
   // Meme raison cote mDNS : la pile de l'hote peut n'etre prete qu'apres le
